@@ -29,6 +29,8 @@ Sessions and notes, 300 fuzzy requests per agent, one run per request ([method a
    ./install.sh --vault ~/path/to/notes
    ```
 
+   Add `--claude` to set it up for Claude Code as well.
+
 3. Ask omp, for example:
 
    ```
@@ -40,7 +42,7 @@ If `~/.local/bin` is not on your PATH, the installer says so and prints the line
 ## Requirements
 
 - Python 3 with SQLite FTS5. The stock Python on macOS and most Linux distros has it, and the installer checks.
-- omp, for the agent and skill.
+- omp, Claude Code (with `--claude`), or both, for the agent, skill and guard.
   The agent runs on omp's `smol` role.
   The benchmark used Claude Haiku there; gpt-oss models failed as agents (see [BENCHMARK.md](BENCHMARK.md)).
 - The CLI alone needs only Python 3, with the standard library.
@@ -53,10 +55,32 @@ If `~/.local/bin` is not on your PATH, the installer says so and prints the line
 | `~/.omp/agent/agents/retriever.md` | The omp agent |
 | `~/.omp/agent/skills/lexsearch/SKILL.md` | The skill the agent loads |
 | `~/.omp/agent/glossary.md` | Your jargon list, copied from `glossary.example.md` (never overwritten) |
+| `~/.omp/agent/AGENTS.md` | Two lines saying the vault is indexed by lexsearch, between `lexsearch:start` and `lexsearch:end` markers |
+| `~/.local/bin/lexsearch-guard` | Symlink to `lexsearch_guard.py`, the guard below |
+| `~/.omp/agent/extensions/lexsearch-guard.js` | Runs the guard before each omp tool call |
 | `~/.config/lexsearch/config.json` | Which folders to index |
 
+With `--claude`, also (under `$CLAUDE_CONFIG_DIR`, default `~/.claude`):
+
+| Path | What it is |
+|---|---|
+| `agents/retriever.md` | The agent, ported to Claude Code |
+| `skills/lexsearch/SKILL.md` | The same skill |
+| `CLAUDE.md` | The same two lines, between the same markers |
+| `settings.json` | A `PreToolUse` hook that runs the guard |
+
 The installer never overwrites a different file without `--force`.
+It only ever touches its own marked block in `AGENTS.md` and `CLAUDE.md`, and adds one hook entry to `settings.json`.
 It prints what it skipped.
+
+## The guard
+
+Told about lexsearch, a model will often grep the notes folder anyway, which is slower and costs more tokens.
+The guard stops that: it blocks a tool call that scans the vault (recursive `grep`, `rg`, `find`, a glob over notes) and tells the model to run `lexsearch search` instead.
+Reading a note, grepping inside one note, and anything outside the vault still go through.
+
+In testing on a 100,000-note vault with Claude Haiku, an instruction alone was either ignored or made the model give up early, and the guard did better than both.
+Install without it with `--no-guard`.
 
 ## CLI
 
@@ -142,7 +166,11 @@ rm ~/.local/bin/lexsearch
 rm ~/.omp/agent/agents/retriever.md
 rm ~/.omp/agent/skills/lexsearch/SKILL.md
 rm ~/.omp/agent/glossary.md
+rm ~/.local/bin/lexsearch-guard ~/.omp/agent/extensions/lexsearch-guard.js
 ```
+
+Then delete the block between the `lexsearch:start` and `lexsearch:end` markers in `~/.omp/agent/AGENTS.md`.
+With `--claude`, also remove `~/.claude/agents/retriever.md` and `~/.claude/skills/lexsearch`, the marked block in `~/.claude/CLAUDE.md`, and the `lexsearch-guard` hook in `~/.claude/settings.json`.
 
 Optional: remove `~/.config/lexsearch` and `~/.cache/lexsearch` too.
 Keep the glossary if you edited it.

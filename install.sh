@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# One-command install for lexsearch: CLI symlink, omp agent and skill, config, first index.
+# One-command install for lexsearch: CLI symlink, omp agent, skill and guard, optionally the same
+# for Claude Code, config, first index.
 # Run it from the clone. Re-running is safe: identical files are left alone, and
 # differing files are only replaced with --force. Honours $HOME and LEXSEARCH_CONFIG,
 # so it can be tested against a temporary home directory.
@@ -7,10 +8,12 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ./install.sh [--vault PATH] [--code PATH]... [--force]
+Usage: ./install.sh [--vault PATH] [--code PATH]... [--claude] [--no-guard] [--force]
 
   --vault PATH   markdown notes folder to index
   --code PATH    git repo to index (repeat for more repos)
+  --claude       also install the skill, agent and guard for Claude Code
+  --no-guard     skip the guard hook that stops agents grepping the vault
   --force        replace differing files and config values
 EOF
 }
@@ -22,11 +25,14 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
 OMP_DIR="$HOME/.omp/agent"
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 CONFIG="${LEXSEARCH_CONFIG:-$HOME/.config/lexsearch/config.json}"
 
 VAULT=""
 CODE=()
 FORCE=0
+CLAUDE=0
+GUARD=1
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -35,6 +41,8 @@ while [ $# -gt 0 ]; do
     --code) [ $# -ge 2 ] || die "--code needs a path"; CODE+=("$2"); shift 2 ;;
     --code=*) CODE+=("${1#*=}"); shift ;;
     --force) FORCE=1; shift ;;
+    --claude) CLAUDE=1; shift ;;
+    --no-guard) GUARD=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "unknown option: $1" ;;
   esac
@@ -67,32 +75,104 @@ place_file() {
   say "wrote    $dst"
 }
 
-# 1. CLI: symlink so `git pull` in the clone updates the installed command.
-mkdir -p "$BIN_DIR"
-LINK="$BIN_DIR/lexsearch"
-TARGET="$HERE/lexsearch.py"
-if [ -L "$LINK" ] && [ "$(readlink "$LINK")" = "$TARGET" ]; then
-  say "ok       $LINK -> $TARGET (unchanged)"
-elif [ -e "$LINK" ] || [ -L "$LINK" ]; then
-  if [ "$FORCE" -eq 0 ]; then
-    say "skipped  $LINK (exists; rerun with --force to replace)"
+# Symlink LINK -> TARGET. A different existing file or link needs --force.
+place_link() {
+  local target="$1" link="$2"
+  mkdir -p "$(dirname "$link")"
+  if [ -L "$link" ] && [ "$(readlink "$link")" = "$target" ]; then
+    say "ok       $link -> $target (unchanged)"
+  elif [ -e "$link" ] || [ -L "$link" ]; then
+    if [ "$FORCE" -eq 0 ]; then
+      say "skipped  $link (exists; rerun with --force to replace)"
+    else
+      rm -f "$link"
+      ln -s "$target" "$link"
+      say "replaced $link -> $target"
+    fi
   else
-    rm -f "$LINK"
-    ln -s "$TARGET" "$LINK"
-    say "replaced $LINK -> $TARGET"
+    ln -s "$target" "$link"
+    say "linked   $link -> $target"
   fi
-else
-  ln -s "$TARGET" "$LINK"
-  say "linked   $LINK -> $TARGET"
+}
+
+# Put TEXT between lexsearch markers in a Markdown file (AGENTS.md, CLAUDE.md). Only the marked
+# block is ever changed; the rest of the file is left as it is.
+place_block() {
+  python3 - "$1" "$2" <<'PY'
+import os
+import sys
+
+path, text = sys.argv[1], open(sys.argv[2], encoding="utf-8").read().strip()
+start, end = "<!-- lexsearch:start -->", "<!-- lexsearch:end -->"
+block = f"{start}\n{text}\n{end}"
+old = open(path, encoding="utf-8").read() if os.path.exists(path) else ""
+if start in old and end in old:
+    new = old[:old.index(start)] + block + old[old.index(end) + len(end):]
+else:
+    new = (old.rstrip("\n") + "\n\n" if old.strip() else "") + block + "\n"
+if new == old:
+    print(f"ok       {path} (unchanged)")
+else:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(new)
+    print(f"{'updated ' if old else 'wrote   '} {path} (lexsearch block)")
+PY
+}
+
+# 1. CLI: symlinks so `git pull` in the clone updates the installed commands.
+place_link "$HERE/lexsearch.py" "$BIN_DIR/lexsearch"
+if [ "$GUARD" -eq 1 ]; then
+  place_link "$HERE/lexsearch_guard.py" "$BIN_DIR/lexsearch-guard"
 fi
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) warn "$BIN_DIR is not on PATH; add: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
 esac
 
-# 2. omp agent and skill.
+# 2. omp agent, skill, a two-line mention in AGENTS.md, and the guard extension.
 place_file "$HERE/omp/agents/retriever.md" "$OMP_DIR/agents/retriever.md"
 place_file "$HERE/omp/skills/lexsearch/SKILL.md" "$OMP_DIR/skills/lexsearch/SKILL.md"
+place_block "$OMP_DIR/AGENTS.md" "$HERE/omp/notes-mention.md"
+if [ "$GUARD" -eq 1 ]; then
+  place_file "$HERE/omp/extensions/lexsearch-guard.js" "$OMP_DIR/extensions/lexsearch-guard.js"
+fi
+
+# 2b. Claude Code: the same skill, the agent, the mention in CLAUDE.md, and the guard as a
+# PreToolUse hook in settings.json. Honours CLAUDE_CONFIG_DIR.
+if [ "$CLAUDE" -eq 1 ]; then
+  place_file "$HERE/claude/agents/retriever.md" "$CLAUDE_DIR/agents/retriever.md"
+  place_file "$HERE/omp/skills/lexsearch/SKILL.md" "$CLAUDE_DIR/skills/lexsearch/SKILL.md"
+  place_block "$CLAUDE_DIR/CLAUDE.md" "$HERE/omp/notes-mention.md"
+  if [ "$GUARD" -eq 1 ]; then
+    python3 - "$CLAUDE_DIR/settings.json" <<'PY'
+import json
+import os
+import sys
+
+path = sys.argv[1]
+command = '"$HOME/.local/bin/lexsearch-guard"'
+if os.path.exists(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError) as exc:
+        sys.exit(f"error: {path} is not readable JSON ({exc}); fix it, then rerun")
+else:
+    cfg = {}
+entries = cfg.setdefault("hooks", {}).setdefault("PreToolUse", [])
+if any("lexsearch-guard" in h.get("command", "") for e in entries for h in e.get("hooks", [])):
+    print(f"ok       {path} (guard hook already there)")
+else:
+    entries.append({"matcher": "Bash|Grep|Glob|Monitor", "hooks": [{"type": "command", "command": command}]})
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    print(f"wrote    {path} (guard hook)")
+PY
+  fi
+fi
 
 # 3. Glossary: only ever created, never overwritten, because it is personal.
 GLOSSARY="$OMP_DIR/glossary.md"
